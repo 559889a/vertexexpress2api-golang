@@ -1,0 +1,37 @@
+# 编译产物和可执行文件
+*.exe
+*.exe~
+vertex2api
+vertex2api.exe
+
+# 数据库文件
+*.db
+*.sqlite
+*.sqlite3
+
+# 环境配置文件
+.env
+.env.local
+
+# 日志文件
+logs/*.log
+
+# Go相关
+*.log
+*.sum
+/vendor
+
+# IDE相关
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 操作系统相关
+.DS_Store
+Thumbs.db
+
+# 其他
+*.bak
+*.backup
