@@ -24,6 +24,7 @@ logs/*.log
 # IDE相关
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 *~
