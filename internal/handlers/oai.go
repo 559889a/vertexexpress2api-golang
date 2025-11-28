@@ -8,11 +8,13 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
 	"vertex2api-golang/internal/keys"
 	"vertex2api-golang/internal/models"
+	"vertex2api-golang/internal/vertex"
 )
 
 const (
@@ -24,15 +26,103 @@ var (
 	keyManager *keys.KeyManager
 	httpClient *http.Client
 
-	// Safety settings to disable content filtering
-	safetySettings = []map[string]string{
-		{"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-		{"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-		{"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-		{"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-		{"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE"},
+	// reasoningTagPattern matches the thinking tag and its content
+	reasoningTagPattern = regexp.MustCompile(`<` + ThinkingTagMarker + `>([\s\S]*?)</` + ThinkingTagMarker + `>`)
+
+	// safetySettings disables content filtering
+	safetySettings = []vertex.SafetySetting{
+		{Category: "HARM_CATEGORY_HARASSMENT", Threshold: "BLOCK_NONE"},
+		{Category: "HARM_CATEGORY_HATE_SPEECH", Threshold: "BLOCK_NONE"},
+		{Category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", Threshold: "BLOCK_NONE"},
+		{Category: "HARM_CATEGORY_DANGEROUS_CONTENT", Threshold: "BLOCK_NONE"},
+		{Category: "HARM_CATEGORY_CIVIC_INTEGRITY", Threshold: "BLOCK_NONE"},
 	}
 )
+
+// OpenAI-compatible request/response types for the proxy endpoint
+
+// chatRequest is the minimal request structure for parsing incoming requests
+type chatRequest struct {
+	Model  string `json:"model"`
+	Stream bool   `json:"stream"`
+}
+
+// proxyRequest is the full request structure sent to Vertex AI OpenAI endpoint
+type proxyRequest struct {
+	Model  string       `json:"model"`
+	Google googleConfig `json:"google"`
+}
+
+// googleConfig contains Vertex AI specific configuration
+type googleConfig struct {
+	SafetySettings   []vertex.SafetySetting `json:"safety_settings"`
+	ThoughtTagMarker string                 `json:"thought_tag_marker"`
+	ThinkingConfig   thinkingConfig         `json:"thinking_config"`
+}
+
+type thinkingConfig struct {
+	IncludeThoughts bool `json:"include_thoughts"`
+}
+
+// streamChunk represents a parsed SSE chunk for streaming responses
+type streamChunk struct {
+	ID      string         `json:"id"`
+	Object  string         `json:"object"`
+	Created int64          `json:"created"`
+	Model   string         `json:"model"`
+	Choices []streamChoice `json:"choices"`
+}
+
+type streamChoice struct {
+	Index        int         `json:"index"`
+	Delta        streamDelta `json:"delta"`
+	FinishReason *string     `json:"finish_reason"`
+}
+
+type streamDelta struct {
+	Role             string `json:"role,omitempty"`
+	Content          string `json:"content,omitempty"`
+	ReasoningContent string `json:"reasoning_content,omitempty"`
+}
+
+// nonStreamResponse represents the non-streaming API response
+type nonStreamResponse struct {
+	ID      string            `json:"id"`
+	Object  string            `json:"object"`
+	Created int64             `json:"created"`
+	Model   string            `json:"model"`
+	Choices []responseChoice  `json:"choices"`
+	Usage   *responseUsage    `json:"usage,omitempty"`
+}
+
+type responseChoice struct {
+	Index        int             `json:"index"`
+	Message      responseMessage `json:"message"`
+	FinishReason string          `json:"finish_reason"`
+}
+
+type responseMessage struct {
+	Role             string `json:"role"`
+	Content          string `json:"content"`
+	ReasoningContent string `json:"reasoning_content,omitempty"`
+}
+
+type responseUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
+// errorResponse represents an OpenAI-compatible error response
+type errorResponse struct {
+	Error errorDetail `json:"error"`
+}
+
+type errorDetail struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+	Code    int    `json:"code"`
+}
 
 // InitClient initializes the vertex client (call after config is loaded)
 func InitClient() {
@@ -90,22 +180,40 @@ func ChatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("ChatCompletions: model=%s (actual=%s, vertex=%s), stream=%v", req.Model, actualModel, vertexModelID, req.Stream)
 
-	// Update model in request body with google/ prefix and add thinking config
-	var reqMap map[string]interface{}
-	json.Unmarshal(body, &reqMap)
-	reqMap["model"] = vertexModelID
-
-	// Add google extra_body for thinking chain support
-	googleConfig := map[string]interface{}{
-		"safety_settings":    safetySettings,
-		"thought_tag_marker": ThinkingTagMarker,
-		"thinking_config": map[string]interface{}{
-			"include_thoughts": true,
-		},
+	// Build the request with google config for thinking chain support
+	// We merge the original request with our additions using a two-pass approach
+	var rawReq map[string]json.RawMessage
+	if err := json.Unmarshal(body, &rawReq); err != nil {
+		sendError(w, http.StatusBadRequest, "invalid_request", "Invalid JSON: "+err.Error())
+		return
 	}
-	reqMap["google"] = googleConfig
 
-	body, _ = json.Marshal(reqMap)
+	// Set the model with google/ prefix
+	modelBytes, err := json.Marshal(vertexModelID)
+	if err != nil {
+		sendError(w, http.StatusInternalServerError, "server_error", "Failed to encode model")
+		return
+	}
+	rawReq["model"] = modelBytes
+
+	// Add google config for thinking chain support
+	gConfig := googleConfig{
+		SafetySettings:   safetySettings,
+		ThoughtTagMarker: ThinkingTagMarker,
+		ThinkingConfig:   thinkingConfig{IncludeThoughts: true},
+	}
+	googleBytes, err := json.Marshal(gConfig)
+	if err != nil {
+		sendError(w, http.StatusInternalServerError, "server_error", "Failed to encode google config")
+		return
+	}
+	rawReq["google"] = googleBytes
+
+	body, err = json.Marshal(rawReq)
+	if err != nil {
+		sendError(w, http.StatusInternalServerError, "server_error", "Failed to encode request")
+		return
+	}
 
 	// Forward to Vertex AI OpenAI-compatible endpoint
 	ctx := r.Context()
@@ -204,167 +312,139 @@ func handleNonStreamingProxy(w http.ResponseWriter, url string, body []byte) err
 
 // processNonStreamingResponse extracts reasoning from thinking tags and adds reasoning_content field
 func processNonStreamingResponse(respBody []byte) []byte {
-	var respMap map[string]interface{}
-	if err := json.Unmarshal(respBody, &respMap); err != nil {
+	var resp nonStreamResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
 		return respBody
 	}
 
-	choices, ok := respMap["choices"].([]interface{})
-	if !ok || len(choices) == 0 {
+	if len(resp.Choices) == 0 {
 		return respBody
 	}
 
-	choice, ok := choices[0].(map[string]interface{})
-	if !ok {
+	// Process the first choice's message content
+	content := resp.Choices[0].Message.Content
+	if content == "" {
 		return respBody
 	}
 
-	message, ok := choice["message"].(map[string]interface{})
-	if !ok {
-		return respBody
-	}
-
-	// Remove extra_content if present
-	delete(message, "extra_content")
-
-	content, ok := message["content"].(string)
-	if !ok || content == "" {
-		return respBody
-	}
-
-	// Extract reasoning from thinking tags
-	reasoning, actualContent := extractReasoningByTags(content, ThinkingTagMarker)
-	message["content"] = actualContent
+	// Extract reasoning from thinking tags using regexp
+	reasoning, actualContent := extractReasoningByTags(content)
+	resp.Choices[0].Message.Content = actualContent
 	if reasoning != "" {
-		message["reasoning_content"] = reasoning
+		resp.Choices[0].Message.ReasoningContent = reasoning
 		log.Printf("Extracted reasoning: %d chars, content: %d chars", len(reasoning), len(actualContent))
 	}
 
-	result, err := json.Marshal(respMap)
+	result, err := json.Marshal(resp)
 	if err != nil {
 		return respBody
 	}
 	return result
 }
 
-// extractReasoningByTags extracts content between thinking tags
-func extractReasoningByTags(content, tagName string) (reasoning, actualContent string) {
-	openTag := "<" + tagName + ">"
-	closeTag := "</" + tagName + ">"
-
-	// Find all reasoning content within tags
-	var reasoningParts []string
-	remaining := content
-
-	for {
-		startIdx := strings.Index(remaining, openTag)
-		if startIdx == -1 {
-			break
-		}
-
-		endIdx := strings.Index(remaining[startIdx:], closeTag)
-		if endIdx == -1 {
-			break
-		}
-		endIdx += startIdx
-
-		// Extract reasoning content
-		reasoningContent := remaining[startIdx+len(openTag) : endIdx]
-		reasoningParts = append(reasoningParts, reasoningContent)
-
-		// Remove the tag and its content from remaining
-		remaining = remaining[:startIdx] + remaining[endIdx+len(closeTag):]
+// extractReasoningByTags extracts content between thinking tags using regexp
+func extractReasoningByTags(content string) (reasoning, actualContent string) {
+	matches := reasoningTagPattern.FindAllStringSubmatch(content, -1)
+	if len(matches) == 0 {
+		return "", content
 	}
 
+	// Collect all reasoning parts
+	reasoningParts := make([]string, 0, len(matches))
+	for _, match := range matches {
+		reasoningParts = append(reasoningParts, match[1])
+	}
+
+	// Remove all tags from content
+	actualContent = strings.TrimSpace(reasoningTagPattern.ReplaceAllString(content, ""))
 	reasoning = strings.Join(reasoningParts, "\n")
-	actualContent = strings.TrimSpace(remaining)
 	return
 }
 
 // StreamingReasoningProcessor handles extraction of reasoning from streaming chunks
+// using a simple state machine approach
 type StreamingReasoningProcessor struct {
-	tagName       string
-	openTag       string
-	closeTag      string
-	insideTag     bool
-	tagBuffer     string
-	reasoningBuf  strings.Builder
+	openTag   string
+	closeTag  string
+	inTag     bool
+	buffer    strings.Builder
+	content   strings.Builder
+	reasoning strings.Builder
 }
 
 // NewStreamingReasoningProcessor creates a new processor
 func NewStreamingReasoningProcessor(tagName string) *StreamingReasoningProcessor {
 	return &StreamingReasoningProcessor{
-		tagName:  tagName,
 		openTag:  "<" + tagName + ">",
 		closeTag: "</" + tagName + ">",
 	}
 }
 
 // ProcessChunk processes a content chunk and returns (processedContent, reasoningContent)
-func (p *StreamingReasoningProcessor) ProcessChunk(content string) (processedContent, reasoningContent string) {
-	// Add content to buffer for processing
-	p.tagBuffer += content
+func (p *StreamingReasoningProcessor) ProcessChunk(chunk string) (processedContent, reasoningContent string) {
+	p.buffer.WriteString(chunk)
+	buf := p.buffer.String()
 
-	var contentParts []string
-	var reasoningParts []string
-
-	for len(p.tagBuffer) > 0 {
-		if p.insideTag {
-			// Look for closing tag
-			closeIdx := strings.Index(p.tagBuffer, p.closeTag)
-			if closeIdx == -1 {
-				// No closing tag yet, might be partial - keep in buffer
-				// But check if we have enough to determine it's definitely not the close tag
-				if len(p.tagBuffer) > len(p.closeTag) {
-					// Output up to last len(closeTag) chars as reasoning
-					reasoningParts = append(reasoningParts, p.tagBuffer[:len(p.tagBuffer)-len(p.closeTag)])
-					p.tagBuffer = p.tagBuffer[len(p.tagBuffer)-len(p.closeTag):]
-				}
+	for {
+		if p.inTag {
+			idx := strings.Index(buf, p.closeTag)
+			if idx < 0 {
+				// Keep buffer minus the potential partial close tag
+				keep := max(0, len(buf)-len(p.closeTag)+1)
+				p.reasoning.WriteString(buf[:keep])
+				p.buffer.Reset()
+				p.buffer.WriteString(buf[keep:])
 				break
 			}
-			// Found closing tag
-			reasoningParts = append(reasoningParts, p.tagBuffer[:closeIdx])
-			p.tagBuffer = p.tagBuffer[closeIdx+len(p.closeTag):]
-			p.insideTag = false
+			p.reasoning.WriteString(buf[:idx])
+			buf = buf[idx+len(p.closeTag):]
+			p.inTag = false
 		} else {
-			// Look for opening tag
-			openIdx := strings.Index(p.tagBuffer, p.openTag)
-			if openIdx == -1 {
-				// No opening tag - check for partial match at end
-				for i := 1; i < len(p.openTag) && i <= len(p.tagBuffer); i++ {
-					if strings.HasPrefix(p.openTag, p.tagBuffer[len(p.tagBuffer)-i:]) {
-						// Potential partial tag at end
-						contentParts = append(contentParts, p.tagBuffer[:len(p.tagBuffer)-i])
-						p.tagBuffer = p.tagBuffer[len(p.tagBuffer)-i:]
-						goto done
-					}
+			idx := strings.Index(buf, p.openTag)
+			if idx < 0 {
+				// Check for partial open tag at the end
+				partialIdx := p.findPartialTagStart(buf)
+				if partialIdx >= 0 {
+					p.content.WriteString(buf[:partialIdx])
+					p.buffer.Reset()
+					p.buffer.WriteString(buf[partialIdx:])
+				} else {
+					p.content.WriteString(buf)
+					p.buffer.Reset()
 				}
-				// No partial match, output all as content
-				contentParts = append(contentParts, p.tagBuffer)
-				p.tagBuffer = ""
 				break
 			}
-			// Found opening tag
-			if openIdx > 0 {
-				contentParts = append(contentParts, p.tagBuffer[:openIdx])
-			}
-			p.tagBuffer = p.tagBuffer[openIdx+len(p.openTag):]
-			p.insideTag = true
+			p.content.WriteString(buf[:idx])
+			buf = buf[idx+len(p.openTag):]
+			p.inTag = true
 		}
 	}
-done:
-	processedContent = strings.Join(contentParts, "")
-	reasoningContent = strings.Join(reasoningParts, "")
+
+	// Return accumulated content and reasoning, then reset accumulators
+	processedContent = p.content.String()
+	reasoningContent = p.reasoning.String()
+	p.content.Reset()
+	p.reasoning.Reset()
 	return
+}
+
+// findPartialTagStart finds where a potential partial open tag starts at the end of buf
+func (p *StreamingReasoningProcessor) findPartialTagStart(buf string) int {
+	for i := 1; i < len(p.openTag) && i <= len(buf); i++ {
+		if buf[len(buf)-i:] == p.openTag[:i] {
+			return len(buf) - i
+		}
+	}
+	return -1
 }
 
 // FlushRemaining returns any remaining buffered content
 func (p *StreamingReasoningProcessor) FlushRemaining() (content, reasoning string) {
-	if p.insideTag {
-		// Unclosed tag - treat remaining as reasoning
-		return "", p.tagBuffer
+	buf := p.buffer.String()
+	if p.inTag {
+		return "", buf
 	}
-	return p.tagBuffer, ""
+	return buf, ""
 }
 
 func handleStreamingProxy(w http.ResponseWriter, url string, body []byte) error {
@@ -387,6 +467,7 @@ func handleStreamingProxy(w http.ResponseWriter, url string, body []byte) error 
 	log.Printf("handleStreamingProxy: response status=%d", resp.StatusCode)
 
 	if resp.StatusCode != http.StatusOK {
+		// Read error response body for logging; ignore read errors on error path
 		respBody, _ := io.ReadAll(resp.Body)
 		log.Printf("handleStreamingProxy: error response: %s", string(respBody))
 		return fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(respBody))
@@ -439,44 +520,24 @@ func handleStreamingProxy(w http.ResponseWriter, url string, body []byte) error 
 				continue
 			}
 
-			// Parse the chunk
-			var chunk map[string]interface{}
+			// Parse the chunk using typed struct
+			var chunk streamChunk
 			if err := json.Unmarshal([]byte(jsonStr), &chunk); err != nil {
 				// Can't parse, forward as-is
 				sendSSE(jsonStr)
 				continue
 			}
 
-			// Extract content from delta
-			choices, ok := chunk["choices"].([]interface{})
-			if !ok || len(choices) == 0 {
-				outputChunk, _ := json.Marshal(chunk)
-				sendSSE(string(outputChunk))
+			// Check if we have content to process
+			if len(chunk.Choices) == 0 {
+				sendSSE(jsonStr)
 				continue
 			}
 
-			choice, ok := choices[0].(map[string]interface{})
-			if !ok {
-				outputChunk, _ := json.Marshal(chunk)
-				sendSSE(string(outputChunk))
-				continue
-			}
-
-			delta, ok := choice["delta"].(map[string]interface{})
-			if !ok {
-				outputChunk, _ := json.Marshal(chunk)
-				sendSSE(string(outputChunk))
-				continue
-			}
-
-			// Remove extra_content if present
-			delete(delta, "extra_content")
-
-			content, hasContent := delta["content"].(string)
-			if !hasContent || content == "" {
+			content := chunk.Choices[0].Delta.Content
+			if content == "" {
 				// No content to process, forward as-is (might have finish_reason)
-				outputChunk, _ := json.Marshal(chunk)
-				sendSSE(string(outputChunk))
+				sendSSE(jsonStr)
 				continue
 			}
 
@@ -485,75 +546,69 @@ func handleStreamingProxy(w http.ResponseWriter, url string, body []byte) error 
 
 			// Send reasoning chunk if any
 			if reasoningContent != "" {
-				reasoningDelta := map[string]interface{}{
-					"reasoning_content": reasoningContent,
+				reasoningChunk := streamChunk{
+					ID:      chunk.ID,
+					Object:  chunk.Object,
+					Created: chunk.Created,
+					Model:   chunk.Model,
+					Choices: []streamChoice{{
+						Index: 0,
+						Delta: streamDelta{ReasoningContent: reasoningContent},
+					}},
 				}
-				reasoningChunk := map[string]interface{}{
-					"id":      chunk["id"],
-					"object":  chunk["object"],
-					"created": chunk["created"],
-					"model":   chunk["model"],
-					"choices": []interface{}{
-						map[string]interface{}{
-							"index":         0,
-							"delta":         reasoningDelta,
-							"finish_reason": nil,
-						},
-					},
+				if reasoningJSON, err := json.Marshal(reasoningChunk); err == nil {
+					sendSSE(string(reasoningJSON))
 				}
-				reasoningJSON, _ := json.Marshal(reasoningChunk)
-				sendSSE(string(reasoningJSON))
 			}
 
 			// Send content chunk if any
 			if processedContent != "" {
-				delta["content"] = processedContent
-				outputChunk, _ := json.Marshal(chunk)
-				sendSSE(string(outputChunk))
-			} else if choice["finish_reason"] != nil {
-				// Has finish_reason but no content - forward the chunk
-				delete(delta, "content")
-				outputChunk, _ := json.Marshal(chunk)
-				sendSSE(string(outputChunk))
+				chunk.Choices[0].Delta.Content = processedContent
+				if outputChunk, err := json.Marshal(chunk); err == nil {
+					sendSSE(string(outputChunk))
+				}
+			} else if chunk.Choices[0].FinishReason != nil {
+				// Has finish_reason but no content - forward the chunk without content
+				chunk.Choices[0].Delta.Content = ""
+				if outputChunk, err := json.Marshal(chunk); err == nil {
+					sendSSE(string(outputChunk))
+				}
 			}
 		}
 	}
 
 	// Flush remaining buffer
 	remainingContent, remainingReasoning := processor.FlushRemaining()
+	now := time.Now().Unix()
 	if remainingReasoning != "" {
-		flushChunk := map[string]interface{}{
-			"id":      fmt.Sprintf("chatcmpl-flush-%d", time.Now().Unix()),
-			"object":  "chat.completion.chunk",
-			"created": time.Now().Unix(),
-			"model":   "unknown",
-			"choices": []interface{}{
-				map[string]interface{}{
-					"index":         0,
-					"delta":         map[string]interface{}{"reasoning_content": remainingReasoning},
-					"finish_reason": nil,
-				},
-			},
+		flushChunk := streamChunk{
+			ID:      fmt.Sprintf("chatcmpl-flush-%d", now),
+			Object:  "chat.completion.chunk",
+			Created: now,
+			Model:   "unknown",
+			Choices: []streamChoice{{
+				Index: 0,
+				Delta: streamDelta{ReasoningContent: remainingReasoning},
+			}},
 		}
-		flushJSON, _ := json.Marshal(flushChunk)
-		sendSSE(string(flushJSON))
+		if flushJSON, err := json.Marshal(flushChunk); err == nil {
+			sendSSE(string(flushJSON))
+		}
 	}
 	if remainingContent != "" {
-		flushChunk := map[string]interface{}{
-			"id":      fmt.Sprintf("chatcmpl-flush-%d", time.Now().Unix()),
-			"object":  "chat.completion.chunk",
-			"created": time.Now().Unix(),
-			"model":   "unknown",
-			"choices": []interface{}{
-				map[string]interface{}{
-					"index":         0,
-					"delta":         map[string]interface{}{"content": remainingContent},
-					"finish_reason": nil,
-				},
-			},
+		flushChunk := streamChunk{
+			ID:      fmt.Sprintf("chatcmpl-flush-%d", now),
+			Object:  "chat.completion.chunk",
+			Created: now,
+			Model:   "unknown",
+			Choices: []streamChoice{{
+				Index: 0,
+				Delta: streamDelta{Content: remainingContent},
+			}},
 		}
-		flushJSON, _ := json.Marshal(flushChunk)
-		sendSSE(string(flushJSON))
+		if flushJSON, err := json.Marshal(flushChunk); err == nil {
+			sendSSE(string(flushJSON))
+		}
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -569,11 +624,11 @@ func sendError(w http.ResponseWriter, statusCode int, errType, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 
-	resp := map[string]interface{}{
-		"error": map[string]interface{}{
-			"message": message,
-			"type":    errType,
-			"code":    statusCode,
+	resp := errorResponse{
+		Error: errorDetail{
+			Message: message,
+			Type:    errType,
+			Code:    statusCode,
 		},
 	}
 	json.NewEncoder(w).Encode(resp)

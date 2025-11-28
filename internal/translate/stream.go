@@ -44,7 +44,10 @@ func (s *StreamState) ProcessChunk(chunk *vertex.GeminiResponse) (content string
 		}
 
 		if part.FunctionCall != nil {
-			args, _ := json.Marshal(part.FunctionCall.Args)
+			args, err := json.Marshal(part.FunctionCall.Args)
+			if err != nil {
+				args = []byte("{}")
+			}
 			toolCalls = append(toolCalls, ToolCall{
 				ID:   generateToolCallID(),
 				Type: "function",

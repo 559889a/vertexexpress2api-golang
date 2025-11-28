@@ -14,14 +14,27 @@ import (
 	"vertex2api-golang/internal/models"
 )
 
+// modelActionPattern parses Gemini API path format: models/{model}:{action}
+var modelActionPattern = regexp.MustCompile(`^models/([^:]+):(.+)$`)
+
+// geminiModel represents a model in the Gemini API format
+type geminiModel struct {
+	Name        string `json:"name"`
+	DisplayName string `json:"displayName"`
+}
+
+// geminiModelsResponse represents the models list response
+type geminiModelsResponse struct {
+	Models []geminiModel `json:"models"`
+}
+
 // GeminiHandler handles /gemini/v1beta/* endpoints
 func GeminiHandler(w http.ResponseWriter, r *http.Request) {
 	// Extract model and action from path
 	// Path format: /gemini/v1beta/models/{model}:{action}
 	path := strings.TrimPrefix(r.URL.Path, "/gemini/v1beta/")
 
-	// Parse model and action
-	modelActionPattern := regexp.MustCompile(`^models/([^:]+):(.+)$`)
+	// Parse model and action using pre-compiled pattern
 	matches := modelActionPattern.FindStringSubmatch(path)
 
 	if len(matches) != 3 {
@@ -100,8 +113,9 @@ func GeminiHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("GeminiHandler response status: %d", resp.StatusCode)
 
-	// If error status, log the response body
+	// If error status, forward the error response to client
 	if resp.StatusCode != http.StatusOK {
+		// Read error response; ignore read errors as we're already on error path
 		respBody, _ := io.ReadAll(resp.Body)
 		log.Printf("GeminiHandler error response: %s", string(respBody))
 		w.Header().Set("Content-Type", "application/json")
@@ -165,21 +179,12 @@ func GeminiModelsHandler(w http.ResponseWriter, r *http.Request) {
 	// Get models from shared models package
 	modelsList := models.GetModels()
 
-	// Build response in Gemini format
-	type GeminiModel struct {
-		Name        string `json:"name"`
-		DisplayName string `json:"displayName"`
-	}
-	type GeminiModelsResponse struct {
-		Models []GeminiModel `json:"models"`
-	}
-
-	resp := GeminiModelsResponse{
-		Models: make([]GeminiModel, 0, len(modelsList)),
+	resp := geminiModelsResponse{
+		Models: make([]geminiModel, 0, len(modelsList)),
 	}
 
 	for _, m := range modelsList {
-		resp.Models = append(resp.Models, GeminiModel{
+		resp.Models = append(resp.Models, geminiModel{
 			Name:        "models/" + m.ID,
 			DisplayName: m.ID,
 		})

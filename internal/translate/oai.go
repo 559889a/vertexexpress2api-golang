@@ -170,7 +170,10 @@ func ToGeminiRequest(oaiReq *ChatCompletionRequest) (*vertex.GeminiRequest, stri
 			if len(msg.ToolCalls) > 0 {
 				for _, tc := range msg.ToolCalls {
 					var args map[string]interface{}
-					json.Unmarshal([]byte(tc.Function.Arguments), &args)
+					if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+						// If args can't be parsed, use empty map
+						args = make(map[string]interface{})
+					}
 					content.Parts = append(content.Parts, vertex.Part{
 						FunctionCall: &vertex.FunctionCall{
 							Name: tc.Function.Name,
@@ -307,70 +310,96 @@ func ToGeminiRequest(oaiReq *ChatCompletionRequest) (*vertex.GeminiRequest, stri
 	return geminiReq, actualModel
 }
 
+// extractTextContent extracts text from OpenAI content field.
+// Content can be either a string or an array of content parts.
 func extractTextContent(content interface{}) string {
-	if content == nil {
-		return ""
-	}
-
 	switch v := content.(type) {
+	case nil:
+		return ""
 	case string:
 		return v
 	case []interface{}:
-		var texts []string
-		for _, part := range v {
-			if m, ok := part.(map[string]interface{}); ok {
-				if m["type"] == "text" {
-					if text, ok := m["text"].(string); ok {
-						texts = append(texts, text)
-					}
-				}
-			}
-		}
-		return strings.Join(texts, "\n")
+		return extractTextFromParts(v)
+	default:
+		return ""
 	}
-	return ""
 }
 
+// extractTextFromParts extracts text from content parts array
+func extractTextFromParts(parts []interface{}) string {
+	var texts []string
+	for _, part := range parts {
+		m, ok := part.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if m["type"] != "text" {
+			continue
+		}
+		if text, ok := m["text"].(string); ok {
+			texts = append(texts, text)
+		}
+	}
+	return strings.Join(texts, "\n")
+}
+
+// convertContentToParts converts OpenAI content to Gemini parts.
+// Content can be either a string or an array of content parts.
 func convertContentToParts(content interface{}) []vertex.Part {
-	if content == nil {
-		return nil
-	}
-
 	switch v := content.(type) {
-	case string:
-		if v != "" {
-			return []vertex.Part{{Text: v}}
-		}
+	case nil:
 		return nil
-
-	case []interface{}:
-		var parts []vertex.Part
-		for _, item := range v {
-			m, ok := item.(map[string]interface{})
-			if !ok {
-				continue
-			}
-
-			partType, _ := m["type"].(string)
-			switch partType {
-			case "text":
-				if text, ok := m["text"].(string); ok && text != "" {
-					parts = append(parts, vertex.Part{Text: text})
-				}
-
-			case "image_url":
-				if imgURL, ok := m["image_url"].(map[string]interface{}); ok {
-					if url, ok := imgURL["url"].(string); ok {
-						if part := parseImageURL(url); part != nil {
-							parts = append(parts, *part)
-						}
-					}
-				}
-			}
+	case string:
+		if v == "" {
+			return nil
 		}
-		return parts
+		return []vertex.Part{{Text: v}}
+	case []interface{}:
+		return convertContentArrayToParts(v)
+	default:
+		return nil
 	}
-	return nil
+}
+
+// convertContentArrayToParts handles array content conversion
+func convertContentArrayToParts(items []interface{}) []vertex.Part {
+	var parts []vertex.Part
+	for _, item := range items {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		part := convertSingleContentPart(m)
+		if part != nil {
+			parts = append(parts, *part)
+		}
+	}
+	return parts
+}
+
+// convertSingleContentPart converts a single content part map to a Gemini Part
+func convertSingleContentPart(m map[string]interface{}) *vertex.Part {
+	partType, _ := m["type"].(string)
+	switch partType {
+	case "text":
+		text, ok := m["text"].(string)
+		if !ok || text == "" {
+			return nil
+		}
+		return &vertex.Part{Text: text}
+	case "image_url":
+		imgURL, ok := m["image_url"].(map[string]interface{})
+		if !ok {
+			return nil
+		}
+		url, ok := imgURL["url"].(string)
+		if !ok {
+			return nil
+		}
+		return parseImageURL(url)
+	default:
+		return nil
+	}
 }
 
 // parseImageURL parses image URL (data URL or markdown base64)
@@ -481,7 +510,10 @@ func FromGeminiResponse(geminiResp *vertex.GeminiResponse, model string, request
 				}
 
 				if part.FunctionCall != nil {
-					args, _ := json.Marshal(part.FunctionCall.Args)
+					args, err := json.Marshal(part.FunctionCall.Args)
+					if err != nil {
+						args = []byte("{}")
+					}
 					choice.Message.ToolCalls = append(choice.Message.ToolCalls, ToolCall{
 						ID:   generateToolCallID(),
 						Type: "function",

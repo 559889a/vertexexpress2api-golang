@@ -328,6 +328,7 @@ func (c *Client) doStreamRequest(ctx context.Context, auth *keys.AuthInfo, model
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		// Read error response body for logging; ignore read errors on error path
 		respBody, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(respBody))
 	}
